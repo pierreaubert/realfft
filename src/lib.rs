@@ -6,7 +6,7 @@ pub use rustfft::FftNum;
 
 use rustfft::num_complex::Complex;
 use rustfft::num_traits::Zero;
-use rustfft::FftPlanner;
+use rustfft::{Fft, FftPlanner, FftPlannerScalar};
 use std::collections::HashMap;
 use std::error;
 use std::fmt;
@@ -230,19 +230,76 @@ where
 /// It caches results internally,
 /// so when making more than one FFT it is advisable to reuse the same planner.
 pub struct RealFftPlanner<T: FftNum> {
-    planner: FftPlanner<T>,
+    planner: PlannerBackend<T>,
     r2c_cache: HashMap<usize, Arc<dyn RealToComplex<T>>>,
     c2r_cache: HashMap<usize, Arc<dyn ComplexToReal<T>>>,
+}
+
+enum PlannerBackend<T: FftNum> {
+    Default(FftPlanner<T>),
+    Scalar(FftPlannerScalar<T>),
+}
+
+/// The complex FFT planner used by a real transform.
+pub trait RealFftInnerPlanner<T: FftNum> {
+    fn plan_forward(&mut self, len: usize) -> Arc<dyn Fft<T>>;
+    fn plan_inverse(&mut self, len: usize) -> Arc<dyn Fft<T>>;
+}
+
+impl<T: FftNum> RealFftInnerPlanner<T> for FftPlanner<T> {
+    fn plan_forward(&mut self, len: usize) -> Arc<dyn Fft<T>> {
+        self.plan_fft_forward(len)
+    }
+
+    fn plan_inverse(&mut self, len: usize) -> Arc<dyn Fft<T>> {
+        self.plan_fft_inverse(len)
+    }
+}
+
+impl<T: FftNum> RealFftInnerPlanner<T> for FftPlannerScalar<T> {
+    fn plan_forward(&mut self, len: usize) -> Arc<dyn Fft<T>> {
+        self.plan_fft_forward(len)
+    }
+
+    fn plan_inverse(&mut self, len: usize) -> Arc<dyn Fft<T>> {
+        self.plan_fft_inverse(len)
+    }
+}
+
+impl<T: FftNum> RealFftInnerPlanner<T> for PlannerBackend<T> {
+    fn plan_forward(&mut self, len: usize) -> Arc<dyn Fft<T>> {
+        match self {
+            Self::Default(planner) => planner.plan_forward(len),
+            Self::Scalar(planner) => planner.plan_forward(len),
+        }
+    }
+
+    fn plan_inverse(&mut self, len: usize) -> Arc<dyn Fft<T>> {
+        match self {
+            Self::Default(planner) => planner.plan_inverse(len),
+            Self::Scalar(planner) => planner.plan_inverse(len),
+        }
+    }
 }
 
 impl<T: FftNum> RealFftPlanner<T> {
     /// Create a new planner.
     pub fn new() -> Self {
-        let planner = FftPlanner::<T>::new();
+        let planner = PlannerBackend::Default(FftPlanner::<T>::new());
         Self {
             r2c_cache: HashMap::new(),
             c2r_cache: HashMap::new(),
             planner,
+        }
+    }
+
+    /// Select RustFFT's scalar planner while retaining realfft's real-transform algorithm.
+    /// Intended for diagnostic comparisons with architecture-specific SIMD planners.
+    pub fn new_scalar() -> Self {
+        Self {
+            planner: PlannerBackend::Scalar(FftPlannerScalar::<T>::new()),
+            r2c_cache: HashMap::new(),
+            c2r_cache: HashMap::new(),
         }
     }
 
@@ -293,11 +350,11 @@ impl<T: FftNum> RealToComplexOdd<T> {
     /// Create a new RealToComplex forward FFT for real-valued input data of a given length,
     /// and uses the given FftPlanner to build the inner FFT.
     /// Panics if the length is not odd.
-    pub fn new(length: usize, fft_planner: &mut FftPlanner<T>) -> Self {
+    pub fn new(length: usize, fft_planner: &mut impl RealFftInnerPlanner<T>) -> Self {
         if length % 2 == 0 {
             panic!("Length must be odd, got {}", length,);
         }
-        let fft = fft_planner.plan_fft_forward(length);
+        let fft = fft_planner.plan_forward(length);
         let scratch_len = fft.get_inplace_scratch_len() + length;
         RealToComplexOdd {
             length,
@@ -371,7 +428,7 @@ impl<T: FftNum> RealToComplexEven<T> {
     /// Create a new RealToComplex forward FFT for real-valued input data of a given length,
     /// and uses the given FftPlanner to build the inner FFT.
     /// Panics if the length is not even.
-    pub fn new(length: usize, fft_planner: &mut FftPlanner<T>) -> Self {
+    pub fn new(length: usize, fft_planner: &mut impl RealFftInnerPlanner<T>) -> Self {
         if length % 2 > 0 {
             panic!("Length must be even, got {}", length,);
         }
@@ -383,7 +440,7 @@ impl<T: FftNum> RealToComplexEven<T> {
         let twiddles: Vec<Complex<T>> = (1..twiddle_count)
             .map(|i| compute_twiddle(i, length) * T::from_f64(0.5).unwrap())
             .collect();
-        let fft = fft_planner.plan_fft_forward(length / 2);
+        let fft = fft_planner.plan_forward(length / 2);
         let scratch_len = fft.get_outofplace_scratch_len();
         RealToComplexEven {
             twiddles,
@@ -524,11 +581,11 @@ impl<T: FftNum> ComplexToRealOdd<T> {
     /// The `length` parameter refers to the length of the resulting real-valued signal.
     /// Uses the given FftPlanner to build the inner FFT.
     /// Panics if the length is not odd.
-    pub fn new(length: usize, fft_planner: &mut FftPlanner<T>) -> Self {
+    pub fn new(length: usize, fft_planner: &mut impl RealFftInnerPlanner<T>) -> Self {
         if length % 2 == 0 {
             panic!("Length must be odd, got {}", length,);
         }
-        let fft = fft_planner.plan_fft_inverse(length);
+        let fft = fft_planner.plan_inverse(length);
         let scratch_len = length + fft.get_inplace_scratch_len();
         ComplexToRealOdd {
             length,
@@ -618,7 +675,7 @@ impl<T: FftNum> ComplexToRealEven<T> {
     /// The `length` parameter refers to the length of the resulting real-valued signal.
     /// Uses the given FftPlanner to build the inner FFT.
     /// Panics if the length is not even.
-    pub fn new(length: usize, fft_planner: &mut FftPlanner<T>) -> Self {
+    pub fn new(length: usize, fft_planner: &mut impl RealFftInnerPlanner<T>) -> Self {
         if length % 2 > 0 {
             panic!("Length must be even, got {}", length,);
         }
@@ -630,7 +687,7 @@ impl<T: FftNum> ComplexToRealEven<T> {
         let twiddles: Vec<Complex<T>> = (1..twiddle_count)
             .map(|i| compute_twiddle(i, length).conj())
             .collect();
-        let fft = fft_planner.plan_fft_inverse(length / 2);
+        let fft = fft_planner.plan_inverse(length / 2);
         let scratch_len = fft.get_outofplace_scratch_len();
         ComplexToRealEven {
             twiddles,
@@ -786,6 +843,55 @@ mod tests {
     use rustfft::FftPlanner;
     use std::error::Error;
     use std::ops::Sub;
+
+    #[test]
+    fn scalar_planner_preserves_even_real_transform_contract() {
+        let mut default = RealFftPlanner::<f32>::new();
+        let mut scalar = RealFftPlanner::<f32>::new_scalar();
+        for len in [2, 256, 512] {
+            let original: Vec<f32> = (0..len)
+                .map(|i| ((i * 17 % 101) as f32 - 50.0) / 101.0)
+                .collect();
+            let mut default_input = original.clone();
+            let mut scalar_input = original.clone();
+            let mut default_spectrum = default.plan_fft_forward(len).make_output_vec();
+            let mut scalar_spectrum = scalar.plan_fft_forward(len).make_output_vec();
+            default
+                .plan_fft_forward(len)
+                .process(&mut default_input, &mut default_spectrum)
+                .unwrap();
+            scalar
+                .plan_fft_forward(len)
+                .process(&mut scalar_input, &mut scalar_spectrum)
+                .unwrap();
+            assert_eq!(default_spectrum.len(), len / 2 + 1);
+            assert_eq!(scalar_spectrum.len(), len / 2 + 1);
+            assert_eq!(default_spectrum[0].im, 0.0);
+            assert_eq!(scalar_spectrum[0].im, 0.0);
+            assert_eq!(default_spectrum[len / 2].im, 0.0);
+            assert_eq!(scalar_spectrum[len / 2].im, 0.0);
+            for (default_bin, scalar_bin) in default_spectrum.iter().zip(&scalar_spectrum) {
+                assert!((default_bin - scalar_bin).norm() <= 1e-3);
+            }
+            let mut default_output = default.plan_fft_inverse(len).make_output_vec();
+            let mut scalar_output = scalar.plan_fft_inverse(len).make_output_vec();
+            default
+                .plan_fft_inverse(len)
+                .process(&mut default_spectrum, &mut default_output)
+                .unwrap();
+            scalar
+                .plan_fft_inverse(len)
+                .process(&mut scalar_spectrum, &mut scalar_output)
+                .unwrap();
+            for (source, (default_sample, scalar_sample)) in original
+                .iter()
+                .zip(default_output.iter().zip(&scalar_output))
+            {
+                assert!((default_sample / len as f32 - source).abs() <= 1e-4);
+                assert!((scalar_sample / len as f32 - source).abs() <= 1e-4);
+            }
+        }
+    }
 
     // get the largest difference
     fn compare_complex<T: Float + Sub>(a: &[Complex<T>], b: &[Complex<T>]) -> T {
